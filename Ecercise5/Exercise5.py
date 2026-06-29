@@ -179,7 +179,7 @@ def run_tests():
     # Тест 10: Проверка корректности первой строки записанного файла
     with open(test_out, 'r') as f:
         first_line = f.readline().strip()
-    assert first_line == '5x10', f"Тест 10 провален: неверный заголовок файла ({first_line})"
+    assert first_line == '5x10', f'Тест 10 провален: неверный заголовок файла ({first_line})'
 
     # Аккуратно удаляем тестовый файл после завершения проверок
     if os.path.exists(test_out):
