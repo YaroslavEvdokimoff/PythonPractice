@@ -1,6 +1,6 @@
 import sqlite3
 import math
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from models import Market, User, Review
 
 
@@ -9,16 +9,12 @@ class DatabaseManager:
 
     def __init__(self, db_path: str):
         self.db_path = db_path
-        self._init_db_features()
-
-    def _init_db_features(self):
-        """Включает поддержку внешних ключей при каждом подключении."""
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("PRAGMA foreign_keys = ON;")
 
     def _get_connection(self) -> sqlite3.Connection:
         """Возвращает подключение с зарегистрированными математическими функциями для расчета миль."""
         conn = sqlite3.connect(self.db_path)
+        
+        # Включаем поддержку внешних ключей (foreign keys) для каскадного удаления
         conn.execute("PRAGMA foreign_keys = ON;")
 
         # Регистрируем функции для формулы гаверсинусов в SQL
@@ -33,32 +29,32 @@ class DatabaseManager:
     def get_markets_paginated(self, page: int, per_page: int,
                               sort_by: str = 'market_name', reverse: bool = False,
                               city: str = "", state: str = "", zip_code: str = "",
-                              c_lat: float = None, c_lon: float = None, max_miles: float = None) -> Tuple[
-        List[Market], int]:
+                              c_lat: float = None, c_lon: float = None, max_miles: float = None) -> Tuple[List[Market], int]:
         """
         Комплексный метод: Пагинация + Фильтрация + Сортировка + Расчет дистанции.
-        Возвращает кортеж: (список объектов Market, общее количество найденных записей).
+        Гарантирует точный подсчет страниц и предотвращает сбои тригонометрии SQLite.
         """
         offset = (page - 1) * per_page
         order = "DESC" if reverse else "ASC"
 
+        # Формируем базовые фильтры таблицы рынков
         where_clauses = ["1=1"]
-        params = []
+        where_params = []
 
         if city:
             where_clauses.append("m.city LIKE ?")
-            params.append(f"%{city}%")
+            where_params.append(f"%{city}%")
         if state:
             where_clauses.append("m.state LIKE ?")
-            params.append(f"%{state}%")
+            where_params.append(f"%{state}%")
         if zip_code:
             where_clauses.append("m.zip LIKE ?")
-            params.append(f"%{zip_code.strip()}%")
+            where_params.append(f"%{zip_code.strip()}%")
 
-        # Формула гаверсинусов на чистом SQL с защитой от пустых (NULL/0) координат
-        distance_sql = "NULL"
+        where_str = " AND ".join(where_clauses)
+
+        # Вычисляем дистанцию (Формула Гаверсинуса)
         if c_lat is not None and c_lon is not None:
-            # Считаем только там, где координаты заполнены корректно
             distance_sql = f"""
             CASE 
                 WHEN m.latitude IS NOT NULL AND m.longitude IS NOT NULL AND m.latitude != 0 AND m.longitude != 0
@@ -70,48 +66,55 @@ class DatabaseManager:
                 ELSE NULL
             END
             """
-            if max_miles is not None:
-                # В блоке фильтрации WHERE отсекаем пустые координаты и проверяем радиус
-                where_clauses.append(
-                    f"m.latitude IS NOT NULL AND m.longitude IS NOT NULL AND m.latitude != 0 AND {distance_sql} <= ?")
-                params.append(max_miles)
+        else:
+            distance_sql = "NULL"
 
-        where_str = " AND ".join(where_clauses)
+        # Создаем общее логическое выражение (Подзапрос), общее для основного запроса и счетчика страниц
+        subquery_filter = ""
+        subquery_params = []
+        if c_lat is not None and c_lon is not None and max_miles is not None:
+            subquery_filter = "WHERE distance IS NOT NULL AND distance <= ?"
+            subquery_params.append(max_miles)
 
+        # Подготовка правил сортировки
         sort_map = {
             'rating': f'avg_rating {order}',
-            'city_state': f'm.state {order}, m.city {order}',
+            'city_state': f'state {order}, city {order}',
             'distance': f'CASE WHEN distance IS NULL THEN 1 ELSE 0 END, distance {order}',
-            'market_name': f'm.market_name {order}'
+            'market_name': f'market_name {order}'
         }
-        sort_column = sort_map.get(sort_by, f'm.market_name {order}')
+        sort_column = sort_map.get(sort_by, f'market_name {order}')
 
-        query = f"""
-            SELECT m.*, 
-                   {distance_sql} AS distance,
-                   COALESCE(AVG(r.rating), 0.0) AS avg_rating,
-                   COUNT(r.id) AS reviews_count
-            FROM markets m
-            LEFT JOIN reviews r ON m.id = r.market_id
-            WHERE {where_str}
-            GROUP BY m.id
-            ORDER BY {sort_column}
-            LIMIT ? OFFSET ?
+        # Единый каркас выборки данных со всеми агрегациями
+        full_wrapper_query = f"""
+            SELECT * FROM (
+                SELECT m.*, 
+                       {distance_sql} AS distance,
+                       COALESCE(AVG(r.rating), 0.0) AS avg_rating,
+                       COUNT(r.id) AS reviews_count
+                FROM markets m
+                LEFT JOIN reviews r ON m.id = r.market_id
+                WHERE {where_str}
+                GROUP BY m.id
+            )
+            {subquery_filter}
         """
 
-        count_query = f"""
-            SELECT COUNT(DISTINCT m.id) AS total FROM markets m
-            WHERE {where_str}
-        """
+        # Строим итоговые SQL-выражения
+        count_query = f"SELECT COUNT(*) AS total FROM ({full_wrapper_query})"
+        main_query = f"{full_wrapper_query} ORDER BY {sort_column} LIMIT ? OFFSET ?"
+
+        # Сбор параметров
+        base_params = where_params + subquery_params
 
         with self._get_connection() as conn:
-            # 1. Безопасно получаем общее количество как целое число
-            res_count = conn.execute(count_query, params).fetchone()
+            # 1. Считаем точное количество записей
+            res_count = conn.execute(count_query, base_params).fetchone()
             total_records = res_count['total'] if res_count else 0
 
-            # 2. Получаем страницу данных
-            final_params = params + [per_page, offset]
-            cursor = conn.execute(query, final_params)
+            # 2. Выгружаем саму страницу данных для Treeview
+            final_params = base_params + [per_page, offset]
+            cursor = conn.execute(main_query, final_params)
             rows = cursor.fetchall()
 
         markets = []
@@ -151,11 +154,10 @@ class DatabaseManager:
         return reviews
 
     def add_review(self, market_id: int, first_name: str, last_name: str, rating: int, text: str):
-        """Добавляет рецензию, автоматически связывая её с пользователем (создает его при необходимости)."""
+        """Добавляет рецензию, автоматически связывая её с пользователем."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
 
-            # Находим или создаем пользователя (ФИО)
             cursor.execute("SELECT id FROM users WHERE first_name = ? AND last_name = ?", (first_name, last_name))
             user_row = cursor.fetchone()
 
@@ -165,7 +167,6 @@ class DatabaseManager:
                 cursor.execute("INSERT INTO users (first_name, last_name) VALUES (?, ?)", (first_name, last_name))
                 user_id = cursor.lastrowid
 
-            # Записываем рецензию
             cursor.execute(
                 "INSERT INTO reviews (market_id, user_id, rating, review_text) VALUES (?, ?, ?, ?)",
                 (market_id, user_id, rating, text)

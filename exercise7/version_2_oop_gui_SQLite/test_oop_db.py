@@ -3,7 +3,8 @@ import os
 import sqlite3
 import math
 from db_manager import DatabaseManager
-from migrations import create_tables
+from migrations import create_tables 
+from models import Market, User, Review
 
 
 class TestDatabaseManager(unittest.TestCase):
@@ -11,6 +12,9 @@ class TestDatabaseManager(unittest.TestCase):
         """Создает временную базу данных в памяти для каждого теста."""
         self.db_path = ":memory:"
         self.conn = sqlite3.connect(self.db_path)
+        
+        # Принудительно включаем foreign keys в тестовом подключении
+        self.conn.execute("PRAGMA foreign_keys = ON;")
         create_tables(self.conn)
 
         # Наполняем тестовыми данными
@@ -26,12 +30,14 @@ class TestDatabaseManager(unittest.TestCase):
         # Инициализируем менеджер
         self.db = DatabaseManager(self.db_path)
 
-        # Переопределяем функции в нашей текущей активной conn
+        # Регистрируем математические функции в нашей текущей активной conn
         self.conn.create_function("acos", 1, math.acos)
         self.conn.create_function("cos", 1, math.cos)
         self.conn.create_function("sin", 1, math.sin)
         self.conn.create_function("radians", 1, math.radians)
         self.conn.row_factory = sqlite3.Row
+        
+        # Переопределяем получение соединения для тестирования в памяти
         self.db._get_connection = lambda: self.conn
 
     def tearDown(self):
@@ -65,7 +71,6 @@ class TestDatabaseManager(unittest.TestCase):
         success = self.db.delete_market(m_id)
 
         self.assertTrue(success)
-        # Проверяем, что отзывов в базе больше нет
         cursor = self.conn.execute("SELECT COUNT(*) FROM reviews WHERE market_id = ?", (m_id,))
         self.assertEqual(cursor.fetchone()[0], 0)
 

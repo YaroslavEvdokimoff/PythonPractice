@@ -21,6 +21,7 @@ class MarketAppGUI:
 
         self.sort_by = "market_name"
         self.reverse_sort = False
+        self.market_objects = {}  # Словарь для хранения связей ID -> Объект Market
 
         self._init_ui()
         self.load_data()
@@ -127,48 +128,54 @@ class MarketAppGUI:
 
     def load_data(self):
         """Извлекает страницу данных из СУБД с учетом фильтров и отправляет в таблицу."""
-        # Чистим старые строки в таблице
         for item in self.tree.get_children():
             self.tree.delete(item)
 
-        # Считываем значения фильтров
         city = self.ent_city.get().strip()
         state = self.ent_state.get().strip()
         zip_code = self.ent_zip.get().strip()
 
-        # Проверяем гео-координаты
         c_lat, c_lon, max_miles = None, None, None
         try:
             if self.ent_lat.get().strip() and self.ent_lon.get().strip():
                 c_lat = float(self.ent_lat.get().strip())
                 c_lon = float(self.ent_lon.get().strip())
+                
+                # Валидация диапазонов координат
+                if not (-90 <= c_lat <= 90) or not (-180 <= c_lon <= 180):
+                    messagebox.showerror("Ошибка валидации", "Широта должна быть от -90 до 90, а долгота от -180 до 180!")
+                    return
+                
                 if self.ent_radius.get().strip():
                     max_miles = float(self.ent_radius.get().strip())
+                    if max_miles < 0:
+                        messagebox.showerror("Ошибка валидации", "Радиус поиска не может быть отрицательным!")
+                        return
         except ValueError:
             messagebox.showerror("Ошибка ввода", "Широта, долгота и радиус должны быть числами!")
             return
 
-        # Получаем данные из СУБД репозитория
-        markets, self.total_records = self.db.get_markets_paginated(
-            page=self.current_page, per_page=self.per_page,
-            sort_by=self.sort_by, reverse=self.reverse_sort,
-            city=city, state=state, zip_code=zip_code,
-            c_lat=c_lat, c_lon=c_lon, max_miles=max_miles
-        )
+        try:
+            markets, self.total_records = self.db.get_markets_paginated(
+                page=self.current_page, per_page=self.per_page,
+                sort_by=self.sort_by, reverse=self.reverse_sort,
+                city=city, state=state, zip_code=zip_code,
+                c_lat=c_lat, c_lon=c_lon, max_miles=max_miles
+            )
+        except Exception as e:
+            messagebox.showerror("Ошибка загрузки данных", f"Не удалось получить данные из СУБД:\n{e}")
+            return
 
-        # Отрисовываем строки Treeview
-        # Отрисовываем строки Treeview (Исправлено сохранение объектов ООП)
-        self.market_objects = {}  # Временный словарь для хранения связей ID -> Объект
+        self.market_objects = {}
         for m in markets:
             dist_val = f"{m.distance}" if m.distance is not None else "—"
             rating_val = f"★ {m.avg_rating}" if m.avg_rating > 0 else "—"
 
-            item_id = self.tree.insert("", tk.END, iid=str(m.db_id), values=(
+            self.tree.insert("", tk.END, iid=str(m.db_id), values=(
                 m.fmid, m.market_name, f"{m.city}, {m.state}", dist_val, rating_val, m.reviews_count
             ))
             self.market_objects[str(m.db_id)] = m
 
-        # Обновляем состояние кнопок пагинатора
         total_pages = max(1, (self.total_records + self.per_page - 1) // self.per_page)
         self.lbl_page_info.config(
             text=f"Страница {self.current_page} из {total_pages} (Всего найдено: {self.total_records})")
@@ -209,7 +216,7 @@ class MarketAppGUI:
             "По удаленности": "distance"
         }
         self.sort_by = crit_map.get(self.cmb_sort.get(), "market_name")
-        self.reverse_sort = True if "Убывание" in self.cmb_direction.get() else False
+        self.reverse_sort = "Убывание" in self.cmb_direction.get()
         self.current_page = 1
         self.load_data()
 
@@ -222,12 +229,14 @@ class MarketAppGUI:
         market_id = int(selected[0])
         if messagebox.askyesno("Подтверждение",
                                "Вы уверены, что хотите безвозвратно удалить этот рынок и все связанные рецензии из СУБД?"):
-            if self.db.delete_market(market_id):
-                messagebox.showinfo("Успех", "Запись рынка успешно удалена каскадным методом.")
-                self.load_data()
+            try:
+                if self.db.delete_market(market_id):
+                    messagebox.showinfo("Успех", "Запись рынка успешно удалена каскадным методом.")
+                    self.load_data()
+            except Exception as e:
+                messagebox.showerror("Ошибка удаления", f"Не удалось удалить запись из СУБД:\n{e}")
 
     def action_open_market_details(self, event):
-        """Открывает диалоговое окно подробной карточки рынка."""
         selected = self.tree.selection()
         if not selected:
             return
@@ -240,8 +249,6 @@ class MarketAppGUI:
 
 
 class MarketDetailsWindow(tk.Toplevel):
-    """Окно детального просмотра карточки фермерского рынка (Пункт 6 ТЗ)."""
-
     def __init__(self, parent, market: Market, db_manager: DatabaseManager, on_close_callback):
         super().__init__(parent)
         self.market = market
@@ -249,14 +256,13 @@ class MarketDetailsWindow(tk.Toplevel):
         self.on_close_callback = on_close_callback
 
         self.title(f"Детали рынка: {market.market_name}")
-        self.geometry("550x600")
-        self.grab_set()  # Делаем окно модальным (блокирует главное окно до закрытия)
+        self.geometry("550x620")
+        self.grab_set()  # Модальный режим
 
         self._init_ui()
         self.load_reviews()
 
     def _init_ui(self):
-        # Панель параметров карточки
         info_frame = ttk.LabelFrame(self, text=" Сведения о фермерском рынке ", padding=10)
         info_frame.pack(fill=tk.X, padx=10, pady=5)
 
@@ -273,12 +279,16 @@ class MarketDetailsWindow(tk.Toplevel):
         for i, text in enumerate(labels):
             ttk.Label(info_frame, text=text, font=("Arial", 10)).grid(row=i, column=0, sticky=tk.W, pady=2)
 
-        # Лента рецензий пользователей
+        # Лента рецензий со скроллбаром
         review_frame = ttk.LabelFrame(self, text=" Рецензии и оценки пользователей ", padding=10)
         review_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
         self.txt_reviews = tk.Text(review_frame, wrap=tk.WORD, state=tk.DISABLED, bg="#f9f9f9")
-        self.txt_reviews.pack(fill=tk.BOTH, expand=True)
+        review_scroll = ttk.Scrollbar(review_frame, orient=tk.VERTICAL, command=self.txt_reviews.yview)
+        self.txt_reviews.configure(yscrollcommand=review_scroll.set)
+        
+        self.txt_reviews.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        review_scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
         # Форма добавления нового отзыва
         add_frame = ttk.LabelFrame(self, text=" Оставить новую рецензию ", padding=10)
@@ -305,9 +315,12 @@ class MarketDetailsWindow(tk.Toplevel):
         btn_submit.grid(row=3, column=0, columnspan=4, pady=5)
 
     def load_reviews(self):
-        """Вычитывает список объектов рецензий из СУБД и форматирует текстовое поле карточки."""
-        m_id = self.market.market_id if hasattr(self.market, 'market_id') else self.market.db_id
-        reviews = self.db.get_market_reviews(m_id)
+        """Вычитывает список объектов рецензий из СУБД и форматирует текстовое поле."""
+        try:
+            reviews = self.db.get_market_reviews(self.market.db_id)
+        except Exception as e:
+            messagebox.showerror("Ошибка СУБД", f"Не удалось загрузить отзывы:\n{e}")
+            return
 
         self.txt_reviews.config(state=tk.NORMAL)
         self.txt_reviews.delete("1.0", tk.END)
@@ -327,21 +340,28 @@ class MarketDetailsWindow(tk.Toplevel):
     def action_submit_review(self):
         fname = self.ent_fname.get().strip()
         lname = self.ent_lname.get().strip()
-        rating = int(self.cmb_rating.get())
         text = self.ent_text.get().strip()
 
         if not fname or not lname:
             messagebox.showerror("Ошибка", "Поля Имя и Фамилия обязательны для создания рецензии!")
             return
 
-        m_id = self.market.market_id if hasattr(self.market, 'market_id') else self.market.db_id
-        self.db.add_review(m_id, fname, lname, rating, text)
+        if not self.cmb_rating.get():
+            messagebox.showerror("Ошибка", "Пожалуйста, выберите оценку рынка!")
+            return
+            
+        rating = int(self.cmb_rating.get())
 
-        messagebox.showinfo("Успех", "Ваша рецензия успешно добавлена в СУБД!")
-        self.ent_fname.delete(0, tk.END)
-        self.ent_lname.delete(0, tk.END)
-        self.ent_text.delete(0, tk.END)
+        try:
+            self.db.add_review(self.market.db_id, fname, lname, rating, text)
+            messagebox.showinfo("Успех", "Ваша рецензия успешно добавлена в СУБД!")
+            
+            # Очистка полей формы
+            self.ent_fname.delete(0, tk.END)
+            self.ent_lname.delete(0, tk.END)
+            self.ent_text.delete(0, tk.END)
 
-        self.load_reviews()
-        self.on_close_callback()  # Обновляем состояние таблицы в главном окне
-
+            self.load_reviews()
+            self.on_close_callback()  # Обновляем таблицу в главном окне
+        except Exception as e:
+            messagebox.showerror("Ошибка СУБД", f"Не удалось сохранить отзыв:\n{e}")
